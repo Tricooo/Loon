@@ -34,7 +34,7 @@ async function operator(proxies = [], targetPlatform, context) {
 
   const method = $arguments.method || 'get'
   const url =
-    $arguments.client === 'Android' ? `https://android.chat.openai.com` : `https://ios.chat.openai.com`
+    $arguments.client === 'MacOS' ? `https://chat.openai.com` : `https://ios.chat.openai.com`
 
   // Gemini / Google AI Studio 检测默认地址
   const geminiUrl = $arguments.gemini_url || 'https://aistudio.google.com'
