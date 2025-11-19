@@ -1,25 +1,29 @@
 /**
- * GPT & Gemini 双重检测 (保守修复版)
- *
- * 逻辑说明:
- * 1. GPT: 恢复使用原作的检测逻辑 (ios.chat.openai.com + 403判定)，确保恢复你之前的效果。
- * 2. Gemini: 增加 Google API (400判定) 检测。
- * 3. 两者独立运行，互不影响。
+ * GPT & Gemini 双重检测 (带缓存版)
+ * 
+ * 解决 Surge 更新超时问题:
+ * 1. 内置缓存机制: 测过的节点在缓存期内不再联网检测。
+ * 2. 默认缓存时间: 24小时 (可在 Sub-Store 脚本操作中调整缓存过期时间)。
+ * 3. 降低默认超时: 5s -> 3s，加速失败节点的跳过。
  */
 
 async function operator(proxies = [], targetPlatform, context) {
   const $ = $substore
   const { isLoon, isSurge } = $.env
   
-  // --- 参数设置 ---
+  // --- 参数配置 ---
+  // 强制开启缓存，除非传入 cache=false
+  const useCache = $arguments.cache !== 'false' 
+  const cache = scriptResourceCache
+  
   const concurrency = parseInt($arguments.concurrency || 10)
-  const timeout = parseInt($arguments.timeout || 5000)
+  // 降低默认超时到 3000ms，防止 Surge 等待过久
+  const timeout = parseInt($arguments.timeout || 3000) 
+  
   const gptPrefix = $arguments.gpt_prefix ?? '[GPT] '
   const geminiPrefix = $arguments.gemini_prefix ?? '[Gemini] '
   
-  // 强制指定 GPT 检测地址 (使用原脚本逻辑)
-  const gptUrl = `https://ios.chat.openai.com`
-  // Gemini API 地址
+  const gptUrl = $arguments.client === 'MacOS' ? `https://chat.openai.com` : `https://ios.chat.openai.com`
   const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-pro?key=AIzaSyD-InvalidKeyForDetection`
 
   const target = isLoon ? 'Loon' : isSurge ? 'Surge' : undefined
@@ -32,122 +36,100 @@ async function operator(proxies = [], targetPlatform, context) {
   return proxies
 
   async function check(proxy) {
+    // 生成缓存 Key (基于节点指纹)
+    const fingerprint = JSON.stringify(
+        Object.fromEntries(
+            Object.entries(proxy).filter(([key]) => !/^(name|collectionName|subName|id|_.*)$/i.test(key))
+        )
+    )
+    const cacheKey = `ai_check_v2:${fingerprint}`
+
     try {
-      const node = ProxyUtils.produce([proxy], target)
-      if (!node) return
-
-      // 初始化状态
-      let isGptOk = false
-      let isGeminiOk = false
-      let gptLatency = 0
-      let geminiLatency = 0
-
-      // --- 定义检测任务 ---
-
-      // 1. GPT 任务 (完全复刻原脚本逻辑)
-      const checkGPT = async () => {
-        try {
-            const start = Date.now()
-            const res = await http({
-                method: 'get',
-                url: gptUrl,
-                headers: {
-                    'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3.1 Mobile/15E148 Safari/604.1',
-                },
-                node,
-                timeout
-            })
-            const status = parseInt(res.status ?? res.statusCode ?? 200)
-            let body = String(res.body ?? res.rawBody)
-            const msg = body // 简单记录
-            
-            // 原脚本的核心判定逻辑
-            if (status === 403 && !/unsupported_country/.test(body)) {
-                isGptOk = true
-                gptLatency = Date.now() - start
-            }
-        } catch (e) {
-            // GPT 检测出错，视为失败，不影响后续
-            // $.error(`[${proxy.name}] GPT Error: ${e.message}`)
-        }
-      }
-
-      // 2. Gemini 任务 (新增)
-      const checkGemini = async () => {
-        try {
-            const start = Date.now()
-            const res = await http({
-                method: 'get', // Gemini API必须用GET
-                url: geminiUrl,
-                headers: {
-                    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-                },
-                node,
-                timeout
-            })
-            const status = parseInt(res.status ?? res.statusCode ?? 200)
-            // Google API 返回 400 说明连通了但Key不对 -> 成功
-            if (status === 400) {
-                isGeminiOk = true
-                geminiLatency = Date.now() - start
-            }
-        } catch (e) {
-            // Gemini 检测出错
-        }
-      }
-
-      // --- 并行执行两个任务 ---
-      // 使用 Promise.allSettled 的变体逻辑，确保一个崩了不影响另一个
-      await Promise.all([checkGPT(), checkGemini()])
-
-      // --- 改名逻辑 ---
-      let prefix = ""
+      let result = undefined
       
-      if (isGeminiOk) {
-        prefix += geminiPrefix
-        proxy._gemini = true
-        proxy._gemini_latency = geminiLatency
+      // 1. 尝试读取缓存
+      if (useCache) {
+          const cachedData = cache.get(cacheKey)
+          if (cachedData) {
+              // $.info(`[${proxy.name}] 使用缓存`)
+              result = cachedData
+          }
       }
 
-      if (isGptOk) {
-        prefix += gptPrefix
-        proxy._gpt = true
-        proxy._gpt_latency = gptLatency
+      // 2. 如果没有缓存，发起网络检测
+      if (!result) {
+          const node = ProxyUtils.produce([proxy], target)
+          if (node) {
+              result = await performNetworkCheck(node, timeout)
+              // 写入缓存 (只有检测成功或明确失败才写入，避免网络波动导致一直存失败)
+              if (useCache) {
+                  cache.set(cacheKey, result)
+              }
+          }
       }
 
-      if (prefix) {
-          proxy.name = prefix + proxy.name
-          // $.info(`[${proxy.name}] 检测完成`)
+      // 3. 应用结果 (重命名)
+      if (result) {
+          let prefix = ""
+          if (result.gemini) {
+              prefix += geminiPrefix
+              proxy._gemini = true
+          }
+          if (result.gpt) {
+              prefix += gptPrefix
+              proxy._gpt = true
+          }
+          if (prefix) {
+              proxy.name = prefix + proxy.name
+          }
       }
 
     } catch (e) {
-      // 兜底错误
-      $.error(`[${proxy.name}] Critical Error: ${e.message}`)
+      // $.error(`[${proxy.name}] Error: ${e.message}`)
     }
   }
 
-  // 复用原脚本的 HTTP 方法，增强兼容性
-  async function http(opt = {}) {
-    const METHOD = opt.method || 'get'
-    const TIMEOUT = parseFloat(opt.timeout || 5000)
-    const RETRIES = 1 // 减少重试，加快速度
-    const RETRY_DELAY = 1000
-
-    let count = 0
-    const fn = async () => {
-      try {
-        return await $.http[METHOD]({ ...opt, timeout: TIMEOUT })
-      } catch (e) {
-        if (count < RETRIES) {
-          count++
-          await $.wait(RETRY_DELAY)
-          return await fn()
-        } else {
-          throw e
-        }
+  // 真正的网络检测逻辑
+  async function performNetworkCheck(node, timeout) {
+      let isGptOk = false
+      let isGeminiOk = false
+      
+      const checkGPT = async () => {
+        try {
+            const res = await http({
+                method: 'get',
+                url: gptUrl,
+                headers: { 'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3.1 Mobile/15E148 Safari/604.1' },
+                node, timeout
+            })
+            const status = parseInt(res.status ?? res.statusCode ?? 200)
+            // 原版判定逻辑
+            if (status === 403 && !/unsupported_country/.test(res.body ?? res.rawBody)) {
+                isGptOk = true
+            }
+        } catch (e) {}
       }
-    }
-    return await fn()
+
+      const checkGemini = async () => {
+        try {
+            const res = await http({
+                method: 'get',
+                url: geminiUrl,
+                headers: { 'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36' },
+                node, timeout
+            })
+            if ((res.status ?? res.statusCode) === 400) isGeminiOk = true
+        } catch (e) {}
+      }
+
+      await Promise.all([checkGPT(), checkGemini()])
+      
+      return { gpt: isGptOk, gemini: isGeminiOk }
+  }
+
+  async function http(opt = {}) {
+    const TIMEOUT = parseFloat(opt.timeout || 3000)
+    return await $.http.get({ ...opt, timeout: TIMEOUT })
   }
 
   function executeAsyncTasks(tasks, { concurrency = 1 } = {}) {
