@@ -13,3 +13,6 @@ DOMAIN, generativeai.google
 DOMAIN, generativelanguage.googleapis.com
 DOMAIN, makersuite.google.com
 DOMAIN, proactivebackend-pa.googleapis.com
+
+#antigravity
+DOMAIN-SUFFIX, antigravity-unleash.goog
