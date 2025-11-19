@@ -1,11 +1,14 @@
 /**
- * GPT & Gemini 双重检测 (v8.0 严格缓存版)
+ * GPT & Gemini 双重检测 (v9.0 完美主义版)
  * 
- * 修复 "后面的节点没有前缀且不再检测" 的问题:
- * 1. 缓存策略升级: 只有当服务器真正返回了数据(无论是成功还是拒绝)才缓存。
- * 2. 超时/错误处理: 网络超时或连接中断 **不写入缓存**。
- *    这意味着：如果第一次有些节点因为网络卡顿没测出来，第二次刷新时脚本会自动重测它们，直到测出来为止。
- * 3. 自动清理旧缓存 (Key升级到 v8)
+ * 核心改进: 
+ * 解决 "部分超时导致误判" 的问题。
+ * 逻辑：只有当 GPT 和 Gemini **都** 返回了明确状态码时，才写入缓存。
+ * 
+ * 场景推演：
+ * 1. Gemini 秒通，GPT 超时 -> 界面显示 [Gemini]，但**不存缓存**。
+ * 2. 下次刷新 -> 因为无缓存，脚本会**重测**该节点。
+ * 3. 只有当两者都测通（或明确被拒）时 -> 存入缓存，以后秒开。
  */
 
 async function operator(proxies = [], targetPlatform, context) {
@@ -14,10 +17,8 @@ async function operator(proxies = [], targetPlatform, context) {
   
   // --- 配置 ---
   const concurrency = parseInt($arguments.concurrency || 10) 
-  // 适当增加超时时间，保证检测准确率
   const requestTimeout = parseInt($arguments.timeout || 5000) 
-  // 全局最大运行时间 (ms)，保留一点余量防止SubStore报错
-  const GLOBAL_TIMEOUT = 25000 
+  const GLOBAL_TIMEOUT = 28000 // 熔断时间
   
   const gptPrefix = $arguments.gpt_prefix ?? '[GPT] '
   const geminiPrefix = $arguments.gemini_prefix ?? '[Gemini] '
@@ -30,14 +31,13 @@ async function operator(proxies = [], targetPlatform, context) {
   const target = isLoon ? 'Loon' : isSurge ? 'Surge' : undefined
   const startTime = Date.now()
 
-  // 待检测列表
   const tasks = []
 
-  // --- 1. 缓存读取阶段 ---
+  // --- 1. 读缓存 ---
   for (const proxy of proxies) {
       const fingerprint = getFingerprint(proxy)
-      // 升级 Key 到 v8，强制废弃之前的错误缓存
-      const cacheKey = `ai_check_v8:${fingerprint}`
+      // 升级 Key 到 v9，清除旧逻辑的缓存
+      const cacheKey = `ai_check_v9:${fingerprint}`
       
       let result = undefined
       if (useCache) {
@@ -45,36 +45,31 @@ async function operator(proxies = [], targetPlatform, context) {
       }
 
       if (result) {
-          // 命中有效缓存，直接改名
           applyPrefix(proxy, result)
       } else {
-          // 未命中，或者之前没测成功，加入重测队列
           tasks.push({ proxy, cacheKey })
       }
   }
 
-  // --- 2. 补漏检测阶段 ---
+  // --- 2. 执行检测 ---
   if (tasks.length > 0) {
       await executeAsyncTasks(
           tasks.map(task => async () => {
-              // 熔断保护：如果时间快到了，停止发起新请求，把机会留给下一次刷新
               if (Date.now() - startTime > GLOBAL_TIMEOUT) return
 
               const node = ProxyUtils.produce([task.proxy], target)
               if (node) {
-                  // 执行网络检测
                   const res = await performNetworkCheck(node, requestTimeout)
                   
-                  // !!! 核心修复：只有当 valid=true (即收到了服务器响应) 时才缓存
-                  // 如果是超时(valid=false)，则不缓存，下次刷新继续测
-                  if (useCache && res.valid) {
+                  // !!! 核心修改 v9 !!!
+                  // 只有当 fully_checked 为 true (即两个服务都有响应，没一个是超时的)
+                  // 才写入缓存。否则下次继续重测。
+                  if (useCache && res.fully_checked) {
                       cache.set(task.cacheKey, res)
                   }
 
-                  // 只要有结果（哪怕是失败的响应），就尝试改名
-                  if (res.valid) {
-                      applyPrefix(task.proxy, res)
-                  }
+                  // 即使不缓存，这次也要先改名显示给用户看
+                  applyPrefix(task.proxy, res)
               }
           }),
           { concurrency }
@@ -88,20 +83,16 @@ async function operator(proxies = [], targetPlatform, context) {
   function applyPrefix(proxy, result) {
       if (!result) return
       let prefix = ""
-      // Gemini
       if (result.gemini) {
           prefix += geminiPrefix
           proxy._gemini = true
       }
-      // GPT
       if (result.gpt) {
           prefix += gptPrefix
           proxy._gpt = true
       }
       
-      // 避免前缀重复堆叠
       if (prefix) {
-          // 清理旧前缀(如果存在)再添加，或者简单判断
           if (!proxy.name.includes(geminiPrefix) && !proxy.name.includes(gptPrefix)) {
               proxy.name = prefix + proxy.name
           }
@@ -111,9 +102,11 @@ async function operator(proxies = [], targetPlatform, context) {
   async function performNetworkCheck(node, timeout) {
       let isGptOk = false
       let isGeminiOk = false
-      let isValidResponse = false // 标记是否收到了有效的网络响应
+      
+      // 记录具体的 HTTP 状态码，用于判断是否超时
+      let gptStatus = 0
+      let geminiStatus = 0
 
-      // GPT 检测
       const checkGPT = async () => {
         try {
             const res = await http({
@@ -124,21 +117,17 @@ async function operator(proxies = [], targetPlatform, context) {
                 },
                 node, timeout
             })
-            const status = parseInt(res.status ?? res.statusCode ?? 0)
+            gptStatus = parseInt(res.status ?? res.statusCode ?? 0)
             const body = res.body ?? res.rawBody ?? ""
             
-            // 只要有状态码，说明连通了 (Valid)
-            if (status > 0) isValidResponse = true
-
-            // 判定逻辑
-            if ([200, 302, 429].includes(status)) isGptOk = true
-            else if (status === 403 && !/unsupported_country|VPN|location/i.test(body)) isGptOk = true
+            // 宽松判定逻辑
+            if ([200, 302, 429].includes(gptStatus)) isGptOk = true
+            else if (gptStatus === 403 && !/unsupported_country|VPN|location/i.test(body)) isGptOk = true
         } catch (e) {
-            // 超时或连接错误，isValidResponse 保持 false
+            gptStatus = 0 // 异常视为 0 (超时/连接中断)
         }
       }
 
-      // Gemini 检测
       const checkGemini = async () => {
         try {
             const res = await http({
@@ -146,23 +135,23 @@ async function operator(proxies = [], targetPlatform, context) {
                 headers: { 'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36' },
                 node, timeout
             })
-            const status = parseInt(res.status ?? res.statusCode ?? 0)
-            
-            // 只要有状态码，说明连通了
-            if (status > 0) isValidResponse = true
-            
-            if (status === 400) isGeminiOk = true
-        } catch (e) {}
+            geminiStatus = parseInt(res.status ?? res.statusCode ?? 0)
+            if (geminiStatus === 400) isGeminiOk = true
+        } catch (e) {
+            geminiStatus = 0
+        }
       }
 
       await Promise.all([checkGPT(), checkGemini()])
       
-      // 返回结构：valid 表示这次检测是否有效（是否应该被缓存）
-      return { gpt: isGptOk, gemini: isGeminiOk, valid: isValidResponse }
+      // 核心判定：是否两个都拿到了状态码？
+      // 只要状态码 > 0，说明连通了（不管是 200 还是 403 还是 500，至少不是 timeout）
+      const fullyChecked = (gptStatus > 0) && (geminiStatus > 0)
+      
+      return { gpt: isGptOk, gemini: isGeminiOk, fully_checked: fullyChecked }
   }
 
   function getFingerprint(proxy) {
-      // 仅使用配置字段生成指纹，忽略名字变化
       return JSON.stringify(Object.fromEntries(Object.entries(proxy).filter(([key]) => !/^(name|collectionName|subName|id|_.*)$/i.test(key))))
   }
 
@@ -193,4 +182,4 @@ async function operator(proxies = [], targetPlatform, context) {
       }
     })
   }
-} 
+}
