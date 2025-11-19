@@ -1,10 +1,12 @@
 /**
- * GPT & Gemini 双重检测 (带缓存版)
+ * GPT & Gemini 双重检测 (v6.0 宽松判定 + 缓存防超时版)
  * 
- * 解决 Surge 更新超时问题:
- * 1. 内置缓存机制: 测过的节点在缓存期内不再联网检测。
- * 2. 默认缓存时间: 24小时 (可在 Sub-Store 脚本操作中调整缓存过期时间)。
- * 3. 降低默认超时: 5s -> 3s，加速失败节点的跳过。
+ * 核心改进:
+ * 1. 宽松判定 (无罪推定): 
+ *    - GPT: 只要返回了 200/302/429，或者 403 但不包含"Region/VPN"字样，统统判定为通过。
+ *    - 解决 Cloudflare 盾导致被误判为不可用的问题。
+ * 2. 保持缓存机制: 解决 Surge 更新超时。
+ * 3. 保持 Gemini 检测。
  */
 
 async function operator(proxies = [], targetPlatform, context) {
@@ -12,18 +14,17 @@ async function operator(proxies = [], targetPlatform, context) {
   const { isLoon, isSurge } = $.env
   
   // --- 参数配置 ---
-  // 强制开启缓存，除非传入 cache=false
   const useCache = $arguments.cache !== 'false' 
   const cache = scriptResourceCache
-  
   const concurrency = parseInt($arguments.concurrency || 10)
-  // 降低默认超时到 3000ms，防止 Surge 等待过久
-  const timeout = parseInt($arguments.timeout || 3000) 
+  // 默认超时 3500ms，给稍微慢点的节点一点机会
+  const timeout = parseInt($arguments.timeout || 3500) 
   
   const gptPrefix = $arguments.gpt_prefix ?? '[GPT] '
   const geminiPrefix = $arguments.gemini_prefix ?? '[Gemini] '
   
-  const gptUrl = $arguments.client === 'MacOS' ? `https://chat.openai.com` : `https://ios.chat.openai.com`
+  // 使用 chatgpt.com，兼容性更好
+  const gptUrl = `https://chatgpt.com`
   const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-pro?key=AIzaSyD-InvalidKeyForDetection`
 
   const target = isLoon ? 'Loon' : isSurge ? 'Surge' : undefined
@@ -36,41 +37,38 @@ async function operator(proxies = [], targetPlatform, context) {
   return proxies
 
   async function check(proxy) {
-    // 生成缓存 Key (基于节点指纹)
+    // 生成缓存 Key
     const fingerprint = JSON.stringify(
         Object.fromEntries(
             Object.entries(proxy).filter(([key]) => !/^(name|collectionName|subName|id|_.*)$/i.test(key))
         )
     )
-    const cacheKey = `ai_check_v2:${fingerprint}`
+    // 升级 key 版本号，强制刷新旧缓存
+    const cacheKey = `ai_check_v6_loose:${fingerprint}`
 
     try {
       let result = undefined
       
-      // 1. 尝试读取缓存
+      // 1. 读取缓存
       if (useCache) {
           const cachedData = cache.get(cacheKey)
-          if (cachedData) {
-              // $.info(`[${proxy.name}] 使用缓存`)
-              result = cachedData
-          }
+          if (cachedData) result = cachedData
       }
 
-      // 2. 如果没有缓存，发起网络检测
+      // 2. 网络检测
       if (!result) {
           const node = ProxyUtils.produce([proxy], target)
           if (node) {
               result = await performNetworkCheck(node, timeout)
-              // 写入缓存 (只有检测成功或明确失败才写入，避免网络波动导致一直存失败)
-              if (useCache) {
-                  cache.set(cacheKey, result)
-              }
+              // 写入缓存
+              if (useCache) cache.set(cacheKey, result)
           }
       }
 
-      // 3. 应用结果 (重命名)
+      // 3. 应用前缀
       if (result) {
           let prefix = ""
+          // 只有当结果为 true 时才加前缀
           if (result.gemini) {
               prefix += geminiPrefix
               proxy._gemini = true
@@ -79,37 +77,64 @@ async function operator(proxies = [], targetPlatform, context) {
               prefix += gptPrefix
               proxy._gpt = true
           }
-          if (prefix) {
-              proxy.name = prefix + proxy.name
+          
+          // 只有当前缀确实不存在时才添加，避免重复 (针对部分特殊场景)
+          if (prefix && !proxy.name.startsWith(prefix.trim())) {
+               proxy.name = prefix + proxy.name
           }
       }
 
     } catch (e) {
-      // $.error(`[${proxy.name}] Error: ${e.message}`)
+      // 忽略错误，保持原样
     }
   }
 
-  // 真正的网络检测逻辑
   async function performNetworkCheck(node, timeout) {
       let isGptOk = false
       let isGeminiOk = false
       
+      // --- GPT 宽松检测 ---
       const checkGPT = async () => {
         try {
             const res = await http({
                 method: 'get',
                 url: gptUrl,
-                headers: { 'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.3.1 Mobile/15E148 Safari/604.1' },
+                headers: { 
+                    // 模拟桌面 Chrome，减少 CF 拦截概率
+                    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8'
+                },
                 node, timeout
             })
-            const status = parseInt(res.status ?? res.statusCode ?? 200)
-            // 原版判定逻辑
-            if (status === 403 && !/unsupported_country/.test(res.body ?? res.rawBody)) {
+            const status = parseInt(res.status ?? res.statusCode ?? 0)
+            const body = res.body ?? res.rawBody ?? ""
+            
+            // === 宽松判定逻辑 ===
+            // 200: 成功加载页面
+            // 302: 跳转 (通常也是通的)
+            // 429: 请求过快 (说明通了)
+            if ([200, 302, 429].includes(status)) {
                 isGptOk = true
+            } 
+            // 403: 需要判断是否是地区封锁
+            else if (status === 403) {
+                // 如果包含 unsupported_country 或 VPN 字样，才是真的不行
+                if (/unsupported_country|VPN|location/i.test(body)) {
+                    isGptOk = false
+                } else {
+                    // 排除掉地区封锁，剩下的 403 通常是 CF 验证盾，
+                    // 对于脚本来说是 403，但对于浏览器用户来说是能打开的。
+                    // 所以这里“大胆”判为 true
+                    isGptOk = true
+                }
             }
-        } catch (e) {}
+        } catch (e) {
+            // 只有连接超时或 DNS 错误才算 false
+        }
       }
 
+      // --- Gemini 检测 (保持严谨) ---
+      // Gemini 只有 400 是稳的，Google 封锁很直接
       const checkGemini = async () => {
         try {
             const res = await http({
@@ -118,17 +143,17 @@ async function operator(proxies = [], targetPlatform, context) {
                 headers: { 'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36' },
                 node, timeout
             })
-            if ((res.status ?? res.statusCode) === 400) isGeminiOk = true
+            const status = parseInt(res.status ?? res.statusCode ?? 0)
+            if (status === 400) isGeminiOk = true
         } catch (e) {}
       }
 
       await Promise.all([checkGPT(), checkGemini()])
-      
       return { gpt: isGptOk, gemini: isGeminiOk }
   }
 
   async function http(opt = {}) {
-    const TIMEOUT = parseFloat(opt.timeout || 3000)
+    const TIMEOUT = parseFloat(opt.timeout || 3500)
     return await $.http.get({ ...opt, timeout: TIMEOUT })
   }
 
@@ -155,4 +180,4 @@ async function operator(proxies = [], targetPlatform, context) {
       }
     })
   }
-} 
+}
