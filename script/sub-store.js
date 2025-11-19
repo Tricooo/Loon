@@ -28,13 +28,6 @@ async function operator(proxies = [], targetPlatform, context) {
       url: 'https://gemini.google.com',
       // 逻辑：Gemini 通常返回 200 或 302 跳转登录
       check: (status, body, msg) => status === 200 || status === 302 || status === 307
-    },
-    {
-      key: 'cld',
-      tag: '[Cld]',
-      url: 'https://claude.ai/login',
-      // 逻辑：Claude 登录页
-      check: (status, body, msg) => status === 200 || status === 307 || status === 302
     }
   ];
 
@@ -184,4 +177,4 @@ async function operator(proxies = [], targetPlatform, context) {
       }
     })
   }
-} 
+}    
