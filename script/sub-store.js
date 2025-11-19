@@ -18,7 +18,7 @@ async function operator(proxies = [], targetPlatform, context) {
   const geminiPrefix = $arguments.gemini_prefix ?? '[Gemini] '
   
   // 强制指定 GPT 检测地址 (使用原脚本逻辑)
-  const gptUrl = $arguments.client === 'MacOS' ? `https://chat.openai.com` : `https://ios.chat.openai.com`
+  const gptUrl = `https://ios.chat.openai.com`
   // Gemini API 地址
   const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-pro?key=AIzaSyD-InvalidKeyForDetection`
 
