@@ -21,7 +21,7 @@ async function operator(proxies = [], targetPlatform, context) {
   
   // 统一使用官方主域，不再使用旧的 ios 二级域名
   const gptUrl = `https://chatgpt.com`
-  const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-pro?key=AIzaSyD-InvalidKeyForDetection`
+  const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-pro?key=InvalidKey`
 
   // 统一的 User-Agent (macOS Chrome 120)，模拟真实用户访问
   const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
@@ -124,9 +124,8 @@ async function operator(proxies = [], targetPlatform, context) {
             // 403: 需要进一步判断
             if ([200, 302, 429].includes(gptStatus)) isGptOk = true
             else if (gptStatus === 403) {
-                // 只有明确写了 unsupported_country 才是真的不行
-                // 其他的 403 大概率是 CF 盾，对于浏览器来说是可以过的
-                if (!/unsupported_country|VPN|location/i.test(body)) {
+                // 只有明确写了 unsupported_country 或 VPN 才是真的不行
+                if (!/unsupported_country|VPN/i.test(body)) {
                     isGptOk = true
                 }
             }
@@ -173,6 +172,10 @@ async function operator(proxies = [], targetPlatform, context) {
         let index = 0
         function executeNextTask() {
           while (index < tasks.length && running < concurrency) {
+            if (Date.now() - startTime > GLOBAL_TIMEOUT) {
+              index = tasks.length // 停止调度新任务，避免触发新的网络请求
+              break
+            }
             index++
             const currentTask = tasks[index - 1]
             running++
