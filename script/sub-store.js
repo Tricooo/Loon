@@ -115,7 +115,7 @@ async function operator(proxies = [], targetPlatform, context) {
         // --- 1. Gemini 地区熔断检测 ---
         // 匹配常见的香港/中国关键词。如果命中，直接判死刑，状态码设为 403 (代表已检测但被拒)
         // 这样 count as "fully_checked"，可以被缓存，且不会发起网络请求
-        const hkRegex = /(?:HongKong|Hong Kong|HK|🇭🇰|香\s*港)/i;
+        const hkRegex = /(?:HongKong|Hong Kong|HK|🇭🇰|香\s*港|港|港中转)/i;
         const isRegionBlocked = hkRegex.test(originalProxy.name);
 
         // --- 2. 定义检测任务 ---
