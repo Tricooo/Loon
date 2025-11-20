@@ -1,25 +1,25 @@
 /**
- * Sub-Store 脚本: ChatGPT 独立检测与筛选
- *
- * 功能：
- * 1. 检测节点是否支持 ChatGPT。
- * 2. 默认直接剔除不可用节点，输出纯净列表。
- * 3. 支持缓存，避免重复检测。
- *
- * 参数 (Arguments):
- * - rename: 'true' | 'false' (默认 'false')。如果设为 true，会在节点名前加 [GPT]。
- * - timeout: 检测超时时间 (默认 5000)
+ * Sub-Store 脚本: ChatGPT 独立检测 (只缓存成功结果)
+ * 
+ * 优化策略：
+ * 1. 只有检测通过(True)的节点才会被写入缓存。
+ * 2. 读取缓存时，如果发现之前的记录是失败，则强制重测(Retry)，绝不直接丢弃。
+ * 3. 这样可以解决 iOS 上因网络波动导致节点被误杀且无法恢复的问题。
+ * 
+ * 参数:
+ * - rename: 'true' | 'false'
+ * - timeout: 默认 5000
+ * - cache: 'false' (可选，强制清除所有缓存)
  */
 
 async function operator(proxies = [], targetPlatform, context) {
     const $ = $substore
     const { isLoon, isSurge } = $.env
 
-    // --- 用户参数 ---
     const concurrency = parseInt($arguments.concurrency || 10)
     const requestTimeout = parseInt($arguments.timeout || 5000)
     const enableRename = ($arguments.rename === 'true')
-
+    
     const GLOBAL_TIMEOUT = 28000
     const prefixStr = $arguments.prefix ?? '[GPT] '
     const checkUrl = `https://chatgpt.com`
@@ -33,19 +33,20 @@ async function operator(proxies = [], targetPlatform, context) {
     const deadline = startTime + GLOBAL_TIMEOUT
     const tasks = []
 
-    // --- 1. 读缓存 & 预处理 ---
+    // --- 1. 读缓存 (只信任 True) ---
     for (const proxy of proxies) {
         const fingerprint = getFingerprint(proxy)
-        // 使用独立的缓存 Key，避免与其他脚本冲突
-        const cacheKey = `gpt_check_standalone_v1:${fingerprint}`
+        const cacheKey = `gpt_check_standalone_v2:${fingerprint}` // 升级版本号以隔离旧缓存
         proxy._cacheKey = cacheKey
 
-        let result = undefined
-        if (useCache) result = cache.get(cacheKey)
+        let cachedRes = undefined
+        if (useCache) cachedRes = cache.get(cacheKey)
 
-        if (result) {
-            proxy._isOk = result.ok
-            if (enableRename && proxy._isOk) addPrefix(proxy)
+        // 核心修改：只有缓存明确记录为 ok=true 时，才跳过检测
+        // 如果缓存不存在，或者缓存记录是失败，都加入 tasks 重测
+        if (cachedRes && cachedRes.ok === true) {
+            proxy._isOk = true
+            if (enableRename) addPrefix(proxy)
         } else {
             tasks.push({ proxy, cacheKey })
         }
@@ -60,11 +61,12 @@ async function operator(proxies = [], targetPlatform, context) {
                 const node = ProxyUtils.produce([task.proxy], target)
                 if (node) {
                     const isOk = await checkGPT(node, requestTimeout)
-
-                    if (useCache) {
-                        cache.set(task.cacheKey, { ok: isOk })
+                    
+                    // 核心修改：只有成功才写入缓存
+                    if (useCache && isOk) {
+                        cache.set(task.cacheKey, { ok: true })
                     }
-
+                    
                     task.proxy._isOk = isOk
                     if (enableRename && isOk) addPrefix(task.proxy)
                 }
@@ -73,13 +75,11 @@ async function operator(proxies = [], targetPlatform, context) {
         )
     }
 
-    // --- 3. 筛选输出 (只返回可用的) ---
     return proxies.filter(p => p._isOk === true)
 
     // --- 辅助函数 ---
 
     function addPrefix(proxy) {
-        // 避免重复添加
         if (!proxy.name.includes(prefixStr)) {
             proxy.name = prefixStr + proxy.name
         }
@@ -99,11 +99,9 @@ async function operator(proxies = [], targetPlatform, context) {
             })
             status = parseInt(res.status ?? res.statusCode ?? 0)
             const body = (res.body ?? res.rawBody ?? "") + ""
-
-            // 判定逻辑
+            
             if ([200, 302, 429].includes(status)) return true
             if (status === 403) {
-                // 403 时，如果 body 里没有典型的拒绝关键词，通常也是通的
                 if (!/(unsupported_country|region not supported|country|access denied|vpn|proxy)/i.test(body)) {
                     return true
                 }
