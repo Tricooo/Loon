@@ -1,4 +1,5 @@
 # Apple Intelligence
+IP-CIDR, 17.250.0.0/16, no-resolve
 DOMAIN-SUFFIX, apple-relay.apple.com
 DOMAIN-SUFFIX, apple-relay.cloudflare.com
 DOMAIN-SUFFIX, apple-relay.fastly-edge.com
