@@ -3,3 +3,8 @@ DOMAIN-SUFFIX, zsxq.com
 DOMAIN-SUFFIX, zxyjhyyxszf.com
 DOMAIN-SUFFIX, servicewechat.com
 DOMAIN-SUFFIX, szjinxintech.com
+DOMAIN-SUFFIX,mijia.tech,DIRECT // Added for: api.mijia.tech:443
+DOMAIN-SUFFIX,tkhealthcare.com,DIRECT // Added for: healthservice.tkhealthcare.com:443
+DOMAIN-SUFFIX,pinzhikeji.net,DIRECT // Added for: http://lujiamm.pinzhikeji.net/pzcatering-gateway/wxdc/38845-14.do?wx
+DOMAIN-SUFFIX,szxhdz.com,DIRECT // Added for: pabaspmj.szxhdz.com:18000
+DOMAIN-SUFFIX,psbc.com,DIRECT // Added for: mcc.psbc.com:9090
